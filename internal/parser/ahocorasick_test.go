@@ -8,44 +8,46 @@ import (
 )
 
 func TestACMatcherFindsEveryLiteral(t *testing.T) {
-	rng := rand.New(rand.NewPCG(1, 2))
-	word := func(n int) string {
-		b := make([]byte, n)
-		for i := range b {
-			b[i] = "abc"[rng.IntN(3)]
+	random := rand.New(rand.NewPCG(1, 2))
+	randomWord := func(length int) string {
+		word := make([]byte, length)
+		for position := range word {
+			word[position] = "abc"[random.IntN(3)]
 		}
 
-		return string(b)
+		return string(word)
 	}
 
 	for round := 0; round < 200; round++ {
-		lits := make([]string, 1+rng.IntN(30))
-		for i := range lits {
-			lits[i] = word(1 + rng.IntN(5))
+		literals := make([]string, 1+random.IntN(30))
+		for literalID := range literals {
+			literals[literalID] = randomWord(1 + random.IntN(5))
 		}
 
-		m := newACMatcher(lits)
-		text := word(rng.IntN(40))
+		matcher := newACMatcher(literals)
+		text := randomWord(random.IntN(40))
 
-		got := map[int32]bool{}
-		m.scan(text, func(lit int32) { got[lit] = true })
+		reported := map[int32]bool{}
+		matcher.scan(text, func(literalID int32) { reported[literalID] = true })
 
-		for i, l := range lits {
-			if strings.Contains(text, l) != got[int32(i)] {
-				t.Fatalf("round %d: literal %q in %q: contains=%v, automaton=%v", round, l, text, !got[int32(i)], got[int32(i)])
+		for literalID, literal := range literals {
+			contains := strings.Contains(text, literal)
+			if contains != reported[int32(literalID)] {
+				t.Fatalf("round %d: literal %q in %q: strings.Contains=%v, matcher=%v",
+					round, literal, text, contains, reported[int32(literalID)])
 			}
 		}
 	}
 }
 
 func TestACMatcherReportsLiteralsInsideLongerMatches(t *testing.T) {
-	lits := []string{"iphone", "phone", "sm-a1"}
-	m := newACMatcher(lits)
+	literals := []string{"iphone", "phone", "sm-a1"}
+	matcher := newACMatcher(literals)
 
-	var got []string
-	m.scan("(iphone; cpu", func(lit int32) { got = append(got, lits[lit]) })
+	var reported []string
+	matcher.scan("(iphone; cpu", func(literalID int32) { reported = append(reported, literals[literalID]) })
 
-	if want := []string{"iphone", "phone"}; !slices.Equal(got, want) {
-		t.Errorf("scan reported %v, want %v", got, want)
+	if want := []string{"iphone", "phone"}; !slices.Equal(reported, want) {
+		t.Errorf("scan reported %v, want %v", reported, want)
 	}
 }
