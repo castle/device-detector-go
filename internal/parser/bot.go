@@ -85,47 +85,44 @@ func (b *Bot) Parse(ua string) (*BotResult, error) {
 		return nil, nil
 	}
 
+	// overall is the entries joined with |, so it matches exactly when one of
+	// them does. Once the gate has narrowed the walk, trying the survivors is
+	// the same check without the large combined regex.
 	only, gated := b.gateSet.SkipGated(ua)
-	if gated && len(only) == 0 {
-		return nil, nil
+	if !gated {
+		overall, err := matchWith(b.overall, ua)
+		if err != nil || overall == nil {
+			return nil, err
+		}
 	}
 
-	pre, err := matchWith(b.overall, ua)
-	if err != nil {
-		return nil, err
-	}
-
-	if pre == nil {
-		return nil, nil
-	}
-
-	walk := func(i int) (*BotResult, error) {
-		m, err := matchWith(b.entries[i].compiled, ua)
-		if err != nil || m == nil {
+	walk := func(entry int) (*BotResult, error) {
+		match, err := matchWith(b.entries[entry].compiled, ua)
+		if err != nil || match == nil {
 			return nil, err
 		}
 
-		e := b.entries[i]
+		bot := b.entries[entry]
 
 		return &BotResult{
 			// Bot::parse substitutes $1..$N in the name from the match,
 			// e.g. name "$1" over regex "(360Spider(?:-Image|-Video)?)".
-			Name:     BuildByMatch(e.Name, m),
-			Category: e.Category,
-			URL:      e.URL,
-			Producer: e.Producer,
+			Name:     BuildByMatch(bot.Name, match),
+			Category: bot.Category,
+			URL:      bot.URL,
+			Producer: bot.Producer,
 		}, nil
 	}
 
 	if !gated {
 		only = make([]int, len(b.entries))
-		for i := range only {
-			only[i] = i
+		for entry := range only {
+			only[entry] = entry
 		}
 	}
 
-	for _, i := range only {
-		if res, err := walk(i); err != nil || res != nil {
+	for _, entry := range only {
+		if res, err := walk(entry); err != nil || res != nil {
 			return res, err
 		}
 	}
@@ -141,14 +138,18 @@ func (b *Bot) IsBot(ua string) (bool, error) {
 		return false, nil
 	}
 
-	if only, gated := b.gateSet.SkipGated(ua); gated && len(only) == 0 {
-		return false, nil
+	only, gated := b.gateSet.SkipGated(ua)
+	if !gated {
+		overall, err := matchWith(b.overall, ua)
+
+		return overall != nil, err
 	}
 
-	pre, err := matchWith(b.overall, ua)
-	if err != nil {
-		return false, err
+	for _, entry := range only {
+		if match, err := matchWith(b.entries[entry].compiled, ua); err != nil || match != nil {
+			return match != nil, err
+		}
 	}
 
-	return pre != nil, nil
+	return false, nil
 }

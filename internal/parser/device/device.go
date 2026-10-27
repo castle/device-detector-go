@@ -181,7 +181,7 @@ type base struct {
 	// probes (the upstream device parsers have no preMatchOverall to lean
 	// on): only brands whose literal occurs in the UA are walked.
 	gateSet *parser.GateSet
-	// modelGates[i] narrows brand i's model walk the same way (nil when the
+	// modelGates[brand] narrows that brand's model walk the same way (nil when the
 	// brand has no model list).
 	modelGates []*parser.GateSet
 }
@@ -202,18 +202,18 @@ func loadBase(fsys fs.FS, name, file string) (base, error) {
 	b.gateSet = parser.CompileGateSet(patterns)
 
 	b.modelGates = make([]*parser.GateSet, len(b.regexes.Entries))
-	for i := range b.regexes.Entries {
-		models := b.regexes.Entries[i].Value.Models
+	for brand := range b.regexes.Entries {
+		models := b.regexes.Entries[brand].Value.Models
 		if len(models) == 0 {
 			continue
 		}
 
 		modelPatterns := make([]string, len(models))
-		for j := range models {
-			modelPatterns[j] = models[j].Regex
+		for model := range models {
+			modelPatterns[model] = models[model].Regex
 		}
 
-		b.modelGates[i] = parser.CompileGateSet(modelPatterns)
+		b.modelGates[brand] = parser.CompileGateSet(modelPatterns)
 	}
 
 	return b, nil
@@ -297,7 +297,7 @@ func (b *base) parse(ua string, hints *parser.ClientHints) (*Result, error) {
 
 	var (
 		matchedBrand string
-		brandIdx     int
+		brandIndex   int
 		regex        *deviceRegex
 		matches      []string
 	)
@@ -311,7 +311,7 @@ func (b *base) parse(ua string, hints *parser.ClientHints) (*Result, error) {
 		}
 
 		matchedBrand = e.Key
-		brandIdx = i
+		brandIndex = i
 		regex = &e.Value
 		matches = m
 
@@ -376,31 +376,31 @@ func (b *base) parse(ua string, hints *parser.ClientHints) (*Result, error) {
 			modelMatches []string
 		)
 
-		walk := func(i int) (bool, error) {
-			mr := &regex.Models[i]
+		walk := func(model int) (bool, error) {
+			candidate := &regex.Models[model]
 
-			m, err := parser.MatchUserAgent(ua, mr.Regex)
-			if err != nil || m == nil {
+			match, err := parser.MatchUserAgent(ua, candidate.Regex)
+			if err != nil || match == nil {
 				return false, err
 			}
 
-			modelRegex = mr
-			modelMatches = m
+			modelRegex = candidate
+			modelMatches = match
 
 			return true, nil
 		}
 
-		if only, ok := b.modelGates[brandIdx].SkipGated(ua); ok {
-			for _, i := range only {
-				if hit, err := walk(i); err != nil {
+		if only, ok := b.modelGates[brandIndex].SkipGated(ua); ok {
+			for _, model := range only {
+				if hit, err := walk(model); err != nil {
 					return nil, err
 				} else if hit {
 					break
 				}
 			}
 		} else {
-			for i := range regex.Models {
-				if hit, err := walk(i); err != nil {
+			for model := range regex.Models {
+				if hit, err := walk(model); err != nil {
 					return nil, err
 				} else if hit {
 					break

@@ -7,36 +7,37 @@ import (
 	"sync"
 )
 
-// GateSet narrows an entry walk (device brands, OS rules, browsers) to the
-// entries that can match a UA. Each pattern is split into its top-level
-// branches. A branch with a selective literal cover admits its entry when one
-// of those literals occurs in the lowercased UA. A branch without one becomes
-// a residual check: its own RE2 superset, run only when one of its short
-// literals occurs (or on every UA when it has none). One Aho-Corasick pass
-// finds every literal in the UA.
+// GateSet narrows an entry walk (device brands and models, OS rules, browsers,
+// bots, other clients) to the entries that can match a UA. Each pattern is
+// split into its top-level branches. A branch with a selective literal cover
+// admits its entry when one of those literals occurs in the lowercased UA. A
+// branch without one becomes a residual check: its own RE2 superset, triggered
+// by one of its short literals (or by every UA when it has none). One
+// Aho-Corasick pass finds every literal in the UA.
 type GateSet struct {
-	ac        *acMatcher
-	admit     [][]int32 // literal id -> entries admitted outright
-	trigger   [][]int32 // literal id -> residual checks it makes worth running
-	checks    []residualCheck
-	alwaysChk []int32 // residual checks with no literal to wait for
-	always    []int   // entries with no provable gate: walked every time
-	n         int
-	scratch   sync.Pool
+	literalMatcher    *acMatcher
+	admittedEntries   [][]int32 // literal id -> entries admitted outright
+	triggeredChecks   [][]int32 // literal id -> residual checks it makes worth running
+	residualChecks    []residualCheck
+	untriggeredChecks []int32 // residual checks with no literal to wait for
+	alwaysWalked      []int   // entries with no provable gate: walked every time
+	entryCount        int
+	scratch           sync.Pool
 }
 
 type residualCheck struct {
 	entry int32
-	re    *regexp.Regexp
-	// eager checks run in the gate: their trigger literals occur in ordinary
-	// browser UAs, so admitting the entry on a hit would admit it on most
-	// traffic.
+	regex *regexp.Regexp
+	// eager checks run in the gate instead of admitting their entry: the
+	// branch is anchored at the start, so its check fails at once on most UAs.
 	eager bool
 }
 
+// gateScratch is SkipGated's per-call state, pooled to keep parses
+// allocation-free.
 type gateScratch struct {
-	mark    []bool
-	chkSeen []bool
+	admitted       []bool // by entry
+	checkTriggered []bool // by residual check
 }
 
 // minResidualLiteral is the shortest literal worth waiting for before running
@@ -51,250 +52,311 @@ var gateSets sync.Map
 // cannot express are recorded as always-walk.
 func CompileGateSet(patterns []string) *GateSet {
 	key := strings.Join(patterns, "\x00")
-	if g, ok := gateSets.Load(key); ok {
-		return g.(*GateSet)
+	if cached, ok := gateSets.Load(key); ok {
+		return cached.(*GateSet)
 	}
 
-	g := compileGateSet(patterns)
-	actual, _ := gateSets.LoadOrStore(key, g)
+	stored, _ := gateSets.LoadOrStore(key, compileGateSet(patterns))
 
-	return actual.(*GateSet)
+	return stored.(*GateSet)
 }
 
 func compileGateSet(patterns []string) *GateSet {
-	g := &GateSet{n: len(patterns)}
+	gateSet := &GateSet{entryCount: len(patterns)}
 
-	var lits []string
+	var literals []string
 
-	ids := map[string]int32{}
-	id := func(l string) int32 {
-		if k, ok := ids[l]; ok {
-			return k
+	literalIDs := map[string]int32{}
+	literalID := func(literal string) int32 {
+		if id, ok := literalIDs[literal]; ok {
+			return id
 		}
 
-		k := int32(len(lits))
-		ids[l] = k
-		lits = append(lits, l)
-		g.admit = append(g.admit, nil)
-		g.trigger = append(g.trigger, nil)
+		id := int32(len(literals))
+		literalIDs[literal] = id
+		literals = append(literals, literal)
+		gateSet.admittedEntries = append(gateSet.admittedEntries, nil)
+		gateSet.triggeredChecks = append(gateSet.triggeredChecks, nil)
 
-		return k
+		return id
 	}
 
-	for i, p := range patterns {
-		admit, residuals, ok := entryGate(p)
+	shared := sharedLiterals(patterns)
+
+	for entry, pattern := range patterns {
+		admitLiterals, residuals, ok := entryGate(pattern, shared)
 		if !ok {
-			g.always = append(g.always, i)
+			gateSet.alwaysWalked = append(gateSet.alwaysWalked, entry)
 
 			continue
 		}
 
-		for _, l := range admit {
-			k := id(l)
-			g.admit[k] = append(g.admit[k], int32(i))
+		for _, literal := range admitLiterals {
+			id := literalID(literal)
+			gateSet.admittedEntries[id] = append(gateSet.admittedEntries[id], int32(entry))
 		}
 
-		for _, r := range residuals {
-			c := int32(len(g.checks))
-			g.checks = append(g.checks, residualCheck{entry: int32(i), re: r.re, eager: r.eager})
+		for _, residual := range residuals {
+			checkID := int32(len(gateSet.residualChecks))
+			gateSet.residualChecks = append(gateSet.residualChecks,
+				residualCheck{entry: int32(entry), regex: residual.regex, eager: residual.eager})
 
-			if len(r.lits) == 0 {
-				g.alwaysChk = append(g.alwaysChk, c)
+			if len(residual.triggerLiterals) == 0 {
+				gateSet.untriggeredChecks = append(gateSet.untriggeredChecks, checkID)
 
 				continue
 			}
 
-			for _, l := range r.lits {
-				k := id(l)
-				g.trigger[k] = append(g.trigger[k], c)
+			for _, literal := range residual.triggerLiterals {
+				id := literalID(literal)
+				gateSet.triggeredChecks[id] = append(gateSet.triggeredChecks[id], checkID)
 			}
 		}
 	}
 
-	g.ac = newACMatcher(lits)
-	g.scratch.New = func() any {
+	gateSet.literalMatcher = newACMatcher(literals)
+	gateSet.scratch.New = func() any {
 		return &gateScratch{
-			mark:    make([]bool, g.n),
-			chkSeen: make([]bool, len(g.checks)),
+			admitted:       make([]bool, gateSet.entryCount),
+			checkTriggered: make([]bool, len(gateSet.residualChecks)),
 		}
 	}
 
-	return g
+	return gateSet
 }
 
+// residualGate is one branch entryGate could not cover with a selective
+// literal: its RE2 superset and the shorter literals that trigger it.
 type residualGate struct {
-	re    *regexp.Regexp
-	lits  []string
-	eager bool
+	regex           *regexp.Regexp
+	triggerLiterals []string
+	eager           bool
+}
+
+// sharedLiteralEntries is how many entries may pick the same literal before it
+// counts as shared. A literal several entries pick, such as "android " in many
+// brand patterns, says little about which entry a UA belongs to.
+const sharedLiteralEntries = 3
+
+// sharedLiterals picks every entry's covers once without preference and
+// returns the literals at least sharedLiteralEntries entries chose. The real
+// pass then prefers any other mandatory part of a pattern over them. Being
+// derived from the patterns, it follows database updates on its own.
+func sharedLiterals(patterns []string) map[string]bool {
+	entriesPicking := map[string]int{}
+
+	for _, pattern := range patterns {
+		admitLiterals, _, _ := entryGate(pattern, nil)
+
+		picked := map[string]bool{}
+		for _, literal := range admitLiterals {
+			if !picked[literal] {
+				picked[literal] = true
+				entriesPicking[literal]++
+			}
+		}
+	}
+
+	shared := map[string]bool{}
+
+	for literal, count := range entriesPicking {
+		if count >= sharedLiteralEntries {
+			shared[literal] = true
+		}
+	}
+
+	return shared
 }
 
 // entryGate splits one database pattern into branches: literals that admit
 // it outright, and residual checks for branches no selective literal covers.
-func entryGate(pattern string) ([]string, []residualGate, bool) {
-	t, ok := re2Translate(stripLookarounds(normalizePattern(pattern)))
+func entryGate(pattern string, shared map[string]bool) ([]string, []residualGate, bool) {
+	translated, ok := re2Translate(stripLookarounds(normalizePattern(pattern)))
 	if !ok {
 		return nil, nil, false
 	}
 
-	ast, err := syntax.Parse(`(?im)(?:`+t+`)`, syntax.Perl)
+	parsed, err := syntax.Parse(`(?im)(?:`+translated+`)`, syntax.Perl)
 	if err != nil {
 		return nil, nil, false
 	}
 
 	var (
-		admit     []string
-		residuals []residualGate
+		admitLiterals []string
+		residuals     []residualGate
 	)
 
-	for _, branch := range topBranches(ast) {
-		lits, ok := coverAtLeast(branch, minGateLiteral)
-		if ok && !commonCover(lits) {
-			admit = append(admit, lits...)
+	for _, branch := range topBranches(parsed) {
+		anchored := anchoredAtStart(branch)
 
-			continue
+		if !anchored {
+			if cover, ok := coverAtLeast(branch, minGateLiteral, shared); ok {
+				admitLiterals = append(admitLiterals, cover...)
+
+				continue
+			}
 		}
 
-		re, err := regexp.Compile(branch.String())
+		regex, err := regexp.Compile(branch.String())
 		if err != nil {
 			return nil, nil, false
 		}
 
-		if ok {
-			residuals = append(residuals, residualGate{re: re, lits: lits, eager: true})
-
-			continue
-		}
-
-		short, _ := coverAtLeast(branch, minResidualLiteral)
-		residuals = append(residuals, residualGate{re: re, lits: short})
+		// An anchored branch can only match at the start of the UA, so its
+		// check fails at once and runs in the gate rather than admitting its
+		// entry on every UA that contains its literal.
+		shortCover, _ := coverAtLeast(branch, minResidualLiteral, shared)
+		residuals = append(residuals, residualGate{regex: regex, triggerLiterals: shortCover, eager: anchored})
 	}
 
-	return admit, residuals, true
+	return admitLiterals, residuals, true
 }
 
-func topBranches(re *syntax.Regexp) []*syntax.Regexp {
-	for re.Op == syntax.OpCapture {
-		re = re.Sub[0]
+// topBranches returns the alternatives of a pattern's top-level |, or the
+// pattern itself when it has none.
+func topBranches(node *syntax.Regexp) []*syntax.Regexp {
+	for node.Op == syntax.OpCapture {
+		node = node.Sub[0]
 	}
 
-	if re.Op == syntax.OpAlternate {
-		return re.Sub
+	if node.Op == syntax.OpAlternate {
+		return node.Sub
 	}
 
-	return []*syntax.Regexp{re}
+	return []*syntax.Regexp{node}
+}
+
+// anchoredAtStart reports whether node can only match at the start of the
+// text (or of a line).
+func anchoredAtStart(node *syntax.Regexp) bool {
+	for {
+		switch node.Op {
+		case syntax.OpBeginText, syntax.OpBeginLine:
+			return true
+		case syntax.OpCapture, syntax.OpConcat:
+			if len(node.Sub) == 0 {
+				return false
+			}
+
+			node = node.Sub[0]
+		default:
+			return false
+		}
+	}
 }
 
 // coverAtLeast returns a lowercased literal cover whose every literal is at
-// least minLen bytes long.
-func coverAtLeast(re *syntax.Regexp, minLen int) ([]string, bool) {
-	lits, ok := literalCover(re)
+// least minLength bytes long.
+func coverAtLeast(node *syntax.Regexp, minLength int, shared map[string]bool) ([]string, bool) {
+	cover, ok := literalCover(node, shared)
 	if !ok {
 		return nil, false
 	}
 
-	out := make([]string, len(lits))
-	for i, l := range lits {
-		if len(l) < minLen {
+	lowered := make([]string, len(cover))
+	for index, literal := range cover {
+		if len(literal) < minLength {
 			return nil, false
 		}
 
-		out[i] = strings.ToLower(l)
+		lowered[index] = strings.ToLower(literal)
 	}
 
-	return out, true
+	return lowered, true
 }
 
 // SkipGated reports whether the walk can be narrowed for ua. When it returns
 // (only, true), entries outside `only` cannot match and the caller walks just
 // those indexes (ascending, possibly empty). (nil, false) means walk everything.
-func (g *GateSet) SkipGated(ua string) ([]int, bool) {
-	if g == nil || g.ac == nil {
+func (gateSet *GateSet) SkipGated(ua string) ([]int, bool) {
+	if gateSet == nil || gateSet.literalMatcher == nil {
 		return nil, false
 	}
 
-	sc := g.scratch.Get().(*gateScratch)
-	defer g.scratch.Put(sc)
+	scratch := gateSet.scratch.Get().(*gateScratch)
+	defer gateSet.scratch.Put(scratch)
 
-	clear(sc.mark)
-	clear(sc.chkSeen)
+	clear(scratch.admitted)
+	clear(scratch.checkTriggered)
 
-	for _, i := range g.always {
-		sc.mark[i] = true
+	for _, entry := range gateSet.alwaysWalked {
+		scratch.admitted[entry] = true
 	}
 
-	g.ac.scan(strings.ToLower(ua), func(lit int32) {
-		for _, e := range g.admit[lit] {
-			sc.mark[e] = true
+	gateSet.literalMatcher.scan(strings.ToLower(ua), func(literalID int32) {
+		for _, entry := range gateSet.admittedEntries[literalID] {
+			scratch.admitted[entry] = true
 		}
 
-		for _, c := range g.trigger[lit] {
-			sc.chkSeen[c] = true
+		for _, checkID := range gateSet.triggeredChecks[literalID] {
+			scratch.checkTriggered[checkID] = true
 		}
 	})
 
-	for _, c := range g.alwaysChk {
-		sc.chkSeen[c] = true
+	for _, checkID := range gateSet.untriggeredChecks {
+		scratch.checkTriggered[checkID] = true
 	}
 
 	// A triggered residual admits its entry without running the check: the
 	// walk's own per-pattern RE2 gate runs it lazily, and only for entries
 	// before the first match.
-	for c, run := range sc.chkSeen {
-		if !run {
+	for checkID, triggered := range scratch.checkTriggered {
+		if !triggered {
 			continue
 		}
 
-		if ch := &g.checks[c]; !ch.eager || (!sc.mark[ch.entry] && ch.re.MatchString(ua)) {
-			sc.mark[ch.entry] = true
+		check := &gateSet.residualChecks[checkID]
+		if !check.eager || (!scratch.admitted[check.entry] && check.regex.MatchString(ua)) {
+			scratch.admitted[check.entry] = true
 		}
 	}
 
-	var only []int
+	var survivors []int
 
-	for i, ok := range sc.mark {
-		if ok {
-			only = append(only, i)
+	for entry, admitted := range scratch.admitted {
+		if admitted {
+			survivors = append(survivors, entry)
 		}
 	}
 
-	if len(only) == g.n {
+	if len(survivors) == gateSet.entryCount {
 		return nil, false
 	}
 
-	if only == nil {
-		only = []int{}
+	if survivors == nil {
+		survivors = []int{}
 	}
 
-	return only, true
+	return survivors, true
 }
 
 // MissedEntries returns the entries whose pattern matches ua but that the
 // gate ruled out. It must always be empty; tests assert that over fixtures.
-func (g *GateSet) MissedEntries(ua string, patterns []string) ([]int, error) {
-	only, gated := g.SkipGated(ua)
+func (gateSet *GateSet) MissedEntries(ua string, patterns []string) ([]int, error) {
+	survivors, gated := gateSet.SkipGated(ua)
 	if !gated {
 		return nil, nil
 	}
 
-	kept := make(map[int]bool, len(only))
-	for _, i := range only {
-		kept[i] = true
+	kept := make(map[int]bool, len(survivors))
+	for _, entry := range survivors {
+		kept[entry] = true
 	}
 
 	var missed []int
 
-	for i, p := range patterns {
-		if kept[i] {
+	for entry, pattern := range patterns {
+		if kept[entry] {
 			continue
 		}
 
-		m, err := MatchUserAgent(ua, p)
+		match, err := MatchUserAgent(ua, pattern)
 		if err != nil {
 			return nil, err
 		}
 
-		if m != nil {
-			missed = append(missed, i)
+		if match != nil {
+			missed = append(missed, entry)
 		}
 	}
 

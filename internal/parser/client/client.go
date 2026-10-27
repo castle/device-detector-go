@@ -101,29 +101,24 @@ func (p *genericParser) Parse(ua string, _ *parser.ClientHints) (*Result, error)
 		return nil, nil
 	}
 
+	// overall is the entries joined with |, so it matches exactly when one of
+	// them does. Once the gate has narrowed the walk, trying the survivors is
+	// the same check without the large combined regex.
 	only, gated := p.gateSet.SkipGated(ua)
-	if gated && len(only) == 0 {
-		return nil, nil
-	}
-
-	overall, err := parser.MatchUserAgent(ua, p.overall)
-	if err != nil {
-		return nil, err
-	}
-
-	if overall == nil {
-		return nil, nil
-	}
-
 	if !gated {
+		overall, err := parser.MatchUserAgent(ua, p.overall)
+		if err != nil || overall == nil {
+			return nil, err
+		}
+
 		only = make([]int, len(p.entries))
-		for i := range only {
-			only[i] = i
+		for entry := range only {
+			only[entry] = entry
 		}
 	}
 
-	for _, i := range only {
-		matches, err := parser.MatchUserAgent(ua, p.entries[i].Regex)
+	for _, entry := range only {
+		matches, err := parser.MatchUserAgent(ua, p.entries[entry].Regex)
 		if err != nil {
 			return nil, err
 		}
@@ -134,8 +129,8 @@ func (p *genericParser) Parse(ua string, _ *parser.ClientHints) (*Result, error)
 
 		return &Result{
 			Type:    p.name,
-			Name:    parser.BuildByMatch(p.entries[i].Name, matches),
-			Version: parser.BuildVersion(p.entries[i].Version, matches, p.truncation),
+			Name:    parser.BuildByMatch(p.entries[entry].Name, matches),
+			Version: parser.BuildVersion(p.entries[entry].Version, matches, p.truncation),
 		}, nil
 	}
 

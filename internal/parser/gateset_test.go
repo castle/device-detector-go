@@ -13,61 +13,69 @@ import (
 func TestLiteralCoverExpandsShortPrefixes(t *testing.T) {
 	cases := []struct {
 		pattern string
+		shared  []string
 		want    []string
 	}{
-		{`a(?:101|110)`, []string{"a101", "a110"}},
-		{`GO[0-9]{3,4}`, []string{"go0", "go9"}},
-		{`SM-[AG][0-9]+`, []string{"sm-a0", "sm-g9"}},
-		{`Android [0-9]+; (?:XQ|SO)-[0-9]{2}`, []string{"; xq-0", "; so-9"}},
+		{`a(?:101|110)`, nil, []string{"a101", "a110"}},
+		{`GO[0-9]{3,4}`, nil, []string{"go0", "go9"}},
+		{`SM-[AG][0-9]+`, nil, []string{"sm-a0", "sm-g9"}},
+		// The longest mandatory part wins unless other entries share it.
+		{`Android [0-9]+; (?:XQ|SO)-[0-9]{2}`, nil, []string{"android 0", "android 9"}},
+		{`Android [0-9]+; (?:XQ|SO)-[0-9]{2}`, []string{"android 0", "android 9"}, []string{"; xq-0", "; so-9"}},
 	}
 
-	for _, c := range cases {
-		ast, err := syntax.Parse(`(?i)(?:`+c.pattern+`)`, syntax.Perl)
+	for _, testCase := range cases {
+		parsed, err := syntax.Parse(`(?i)(?:`+testCase.pattern+`)`, syntax.Perl)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		lits, ok := coverAtLeast(ast, minGateLiteral)
+		shared := map[string]bool{}
+		for _, literal := range testCase.shared {
+			shared[literal] = true
+		}
+
+		cover, ok := coverAtLeast(parsed, minGateLiteral, shared)
 		if !ok {
-			t.Errorf("%s: no cover", c.pattern)
+			t.Errorf("%s: no cover", testCase.pattern)
 
 			continue
 		}
 
-		for _, w := range c.want {
-			if !slices.Contains(lits, w) {
-				t.Errorf("%s: cover %v lacks %q", c.pattern, lits, w)
+		for _, wanted := range testCase.want {
+			if !slices.Contains(cover, wanted) {
+				t.Errorf("%s: cover %v lacks %q", testCase.pattern, cover, wanted)
 			}
 		}
 	}
 }
 
 func TestGateSetKeepsEveryMatchingEntry(t *testing.T) {
-	uas := fixtureUserAgents(t, "../../testdata/fixtures", 7)
+	userAgents := fixtureUserAgents(t, "../../testdata/fixtures", 7)
 
-	b, err := NewBot(os.DirFS("../../data/regexes"))
+	bots, err := NewBot(os.DirFS("../../data/regexes"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	botPatterns := make([]string, len(b.entries))
-	for i := range b.entries {
-		botPatterns[i] = b.entries[i].Regex
+	botPatterns := make([]string, len(bots.entries))
+	for index := range bots.entries {
+		botPatterns[index] = bots.entries[index].Regex
 	}
 
-	o, err := NewOS(os.DirFS("../../data/regexes"))
+	operatingSystems, err := NewOS(os.DirFS("../../data/regexes"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	osPatterns := make([]string, len(o.rules))
-	for i := range o.rules {
-		osPatterns[i] = o.rules[i].Regex
+	osPatterns := make([]string, len(operatingSystems.rules))
+	for index := range operatingSystems.rules {
+		osPatterns[index] = operatingSystems.rules[index].Regex
 	}
 
-	for _, ua := range uas {
-		assertGateKeeps(t, "bots", b.gateSet, ua, botPatterns)
-		assertGateKeeps(t, "oss", o.gateSet, ua, osPatterns)
+	for _, ua := range userAgents {
+		assertGateKeeps(t, "bots", bots.gateSet, ua, botPatterns)
+		assertGateKeeps(t, "oss", operatingSystems.gateSet, ua, osPatterns)
 	}
 }
 
@@ -81,42 +89,42 @@ func fixtureUserAgents(t testing.TB, dir string, every int) []string {
 		t.Fatalf("no fixtures under %s: %v", dir, err)
 	}
 
-	var uas []string
+	var userAgents []string
 
-	for _, f := range files {
-		raw, err := os.ReadFile(f)
+	for _, file := range files {
+		raw, err := os.ReadFile(file)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		var cases []struct {
+		var fixtures []struct {
 			UserAgent string `yaml:"user_agent"`
 		}
-		if err := yaml.Unmarshal(raw, &cases); err != nil {
-			t.Fatalf("%s: %v", f, err)
+		if err := yaml.Unmarshal(raw, &fixtures); err != nil {
+			t.Fatalf("%s: %v", file, err)
 		}
 
-		for i, c := range cases {
-			if i%every == 0 {
-				uas = append(uas, c.UserAgent)
+		for index, fixture := range fixtures {
+			if index%every == 0 {
+				userAgents = append(userAgents, fixture.UserAgent)
 			}
 		}
 	}
 
-	return uas
+	return userAgents
 }
 
 // assertGateKeeps fails when the gate rules out an entry whose pattern
 // matches ua.
-func assertGateKeeps(t testing.TB, name string, g *GateSet, ua string, patterns []string) {
+func assertGateKeeps(t testing.TB, name string, gateSet *GateSet, ua string, patterns []string) {
 	t.Helper()
 
-	missed, err := g.MissedEntries(ua, patterns)
+	missed, err := gateSet.MissedEntries(ua, patterns)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	for _, i := range missed {
-		t.Errorf("%s: gate dropped entry %d (%.60s) that matches %q", name, i, patterns[i], ua)
+	for _, entry := range missed {
+		t.Errorf("%s: gate dropped entry %d (%.60s) that matches %q", name, entry, patterns[entry], ua)
 	}
 }

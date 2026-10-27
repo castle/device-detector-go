@@ -131,64 +131,65 @@ func re2Translate(p string) (string, bool) {
 const minGateLiteral = 3
 
 // literalCover walks a parsed regex and returns literals such that any match
-// must contain at least one of them.
-func literalCover(re *syntax.Regexp) ([]string, bool) {
-	switch re.Op {
+// must contain at least one of them. Where it has a choice, it avoids the
+// shared literals (see sharedLiterals).
+func literalCover(node *syntax.Regexp, shared map[string]bool) ([]string, bool) {
+	switch node.Op {
 	case syntax.OpLiteral:
-		return []string{string(re.Rune)}, true
+		return []string{string(node.Rune)}, true
 
 	case syntax.OpCapture:
-		return literalCover(re.Sub[0])
+		return literalCover(node.Sub[0], shared)
 
 	case syntax.OpPlus:
 		// The body occurs at least once.
-		return literalCover(re.Sub[0])
+		return literalCover(node.Sub[0], shared)
 
 	case syntax.OpRepeat:
-		if re.Min >= 1 {
-			return literalCover(re.Sub[0])
+		if node.Min >= 1 {
+			return literalCover(node.Sub[0], shared)
 		}
 
 		return nil, false
 
 	case syntax.OpConcat:
-		// Any mandatory component covers the whole concat; pick the one with
-		// the longest shortest-literal (most selective probe).
+		// Any mandatory part covers the whole concat; pick the best-scoring
+		// one (most selective probe).
 		var best []string
 
 		bestScore := -1
 
-		for _, sub := range re.Sub {
-			lits, ok := literalCover(sub)
+		for _, part := range node.Sub {
+			cover, ok := literalCover(part, shared)
 			if !ok {
 				continue
 			}
 
-			if score := coverScore(lits); score > bestScore {
-				best, bestScore = lits, score
+			if score := coverScore(cover, shared); score > bestScore {
+				best, bestScore = cover, score
 			}
 		}
 
 		// A run of consecutive parts with a small finite language expands to
 		// exact strings: a(?:101|110) yields a101 and a110, not just a.
-		for i := range re.Sub {
-			acc := []string{""}
+		for start := range node.Sub {
+			expanded := []string{""}
 
-			for j := i; j < len(re.Sub); j++ {
-				set, last, ok := windowPart(re.Sub[j])
+			for end := start; end < len(node.Sub); end++ {
+				partStrings, endsRun, ok := windowPart(node.Sub[end])
 				if !ok {
 					break
 				}
 
-				if acc = product(acc, set); acc == nil {
+				if expanded = product(expanded, partStrings); expanded == nil {
 					break
 				}
 
-				if score := coverScore(acc); score > bestScore {
-					best, bestScore = acc, score
+				if score := coverScore(expanded, shared); score > bestScore {
+					best, bestScore = expanded, score
 				}
 
-				if last {
+				if endsRun {
 					break
 				}
 			}
@@ -199,18 +200,18 @@ func literalCover(re *syntax.Regexp) ([]string, bool) {
 	case syntax.OpAlternate:
 		// Every branch must contribute, else a literal-free branch could
 		// match without any probe hitting.
-		var all []string
+		var union []string
 
-		for _, sub := range re.Sub {
-			lits, ok := literalCover(sub)
+		for _, branch := range node.Sub {
+			cover, ok := literalCover(branch, shared)
 			if !ok {
 				return nil, false
 			}
 
-			all = append(all, lits...)
+			union = append(union, cover...)
 		}
 
-		return all, true
+		return union, true
 
 	default:
 		// Char classes, anchors, stars, empty matches: no literal to prove.
@@ -254,114 +255,130 @@ func compileGate(pattern string) *regexp.Regexp {
 // stripLookarounds drops lookaround groups and word boundaries. Each only
 // narrows what a pattern matches, so the result matches a superset of inputs
 // and its literal cover still gates the original pattern.
-func stripLookarounds(p string) string {
-	var b strings.Builder
-	for i := 0; i < len(p); i++ {
+func stripLookarounds(pattern string) string {
+	var stripped strings.Builder
+
+	for position := 0; position < len(pattern); position++ {
 		switch {
-		case p[i] == '\\' && i+1 < len(p):
-			if p[i+1] == 'b' || p[i+1] == 'B' {
-				i++
+		case pattern[position] == '\\' && position+1 < len(pattern):
+			if escaped := pattern[position+1]; escaped == 'b' || escaped == 'B' {
+				position++
+
 				continue
 			}
-			b.WriteByte(p[i])
-			b.WriteByte(p[i+1])
-			i++
-		case p[i] == '(' && (strings.HasPrefix(p[i:], "(?=") || strings.HasPrefix(p[i:], "(?!") ||
-			strings.HasPrefix(p[i:], "(?<=") || strings.HasPrefix(p[i:], "(?<!")):
+
+			stripped.WriteByte(pattern[position])
+			stripped.WriteByte(pattern[position+1])
+			position++
+
+		case pattern[position] == '(' && isLookaround(pattern[position:]):
+			// Skip to the group's closing parenthesis, stepping over escapes.
 			depth := 0
-			for ; i < len(p); i++ {
-				if p[i] == '\\' {
-					i++
+
+			for ; position < len(pattern); position++ {
+				if pattern[position] == '\\' {
+					position++
+
 					continue
 				}
-				if p[i] == '(' {
+
+				if pattern[position] == '(' {
 					depth++
-				} else if p[i] == ')' {
+				} else if pattern[position] == ')' {
 					depth--
 					if depth == 0 {
 						break
 					}
 				}
 			}
+
 		default:
-			b.WriteByte(p[i])
+			stripped.WriteByte(pattern[position])
 		}
 	}
-	return b.String()
+
+	return stripped.String()
+}
+
+func isLookaround(group string) bool {
+	return strings.HasPrefix(group, "(?=") || strings.HasPrefix(group, "(?!") ||
+		strings.HasPrefix(group, "(?<=") || strings.HasPrefix(group, "(?<!")
 }
 
 // maxExpand caps how many exact strings one sub-pattern may expand into.
 const maxExpand = 64
 
-// exactSet returns every string re can match when that set is small and
+// exactSet returns every string node can match when that set is small and
 // finite, lowercased. ok=false for anything unbounded or too large.
-func exactSet(re *syntax.Regexp) ([]string, bool) {
-	switch re.Op {
+func exactSet(node *syntax.Regexp) ([]string, bool) {
+	switch node.Op {
 	case syntax.OpLiteral:
-		return []string{strings.ToLower(string(re.Rune))}, true
+		return []string{strings.ToLower(string(node.Rune))}, true
 
 	case syntax.OpEmptyMatch:
 		return []string{""}, true
 
 	case syntax.OpCapture:
-		return exactSet(re.Sub[0])
+		return exactSet(node.Sub[0])
 
 	case syntax.OpCharClass:
-		var out []string
+		// node.Rune holds the class as inclusive [low, high] pairs.
+		var members []string
 
-		for i := 0; i < len(re.Rune); i += 2 {
-			if re.Rune[i+1]-re.Rune[i] >= maxExpand {
+		for pair := 0; pair < len(node.Rune); pair += 2 {
+			low, high := node.Rune[pair], node.Rune[pair+1]
+			if high-low >= maxExpand {
 				return nil, false
 			}
 
-			for r := re.Rune[i]; r <= re.Rune[i+1]; r++ {
-				out = append(out, strings.ToLower(string(r)))
+			for member := low; member <= high; member++ {
+				members = append(members, strings.ToLower(string(member)))
 			}
 		}
 
-		out = dedupe(out)
+		members = dedupe(members)
 
-		return out, len(out) <= maxExpand
+		return members, len(members) <= maxExpand
 
 	case syntax.OpQuest:
-		set, ok := exactSet(re.Sub[0])
+		optional, ok := exactSet(node.Sub[0])
 		if !ok {
 			return nil, false
 		}
 
-		return dedupe(append(set, "")), true
+		return dedupe(append(optional, "")), true
 
 	case syntax.OpConcat:
-		acc := []string{""}
+		expanded := []string{""}
 
-		for _, sub := range re.Sub {
-			set, ok := exactSet(sub)
+		for _, part := range node.Sub {
+			partStrings, ok := exactSet(part)
 			if !ok {
 				return nil, false
 			}
 
-			if acc = product(acc, set); acc == nil {
+			if expanded = product(expanded, partStrings); expanded == nil {
 				return nil, false
 			}
 		}
 
-		return acc, true
+		return expanded, true
 
 	case syntax.OpAlternate:
-		var out []string
+		var union []string
 
-		for _, sub := range re.Sub {
-			set, ok := exactSet(sub)
+		for _, branch := range node.Sub {
+			branchStrings, ok := exactSet(branch)
 			if !ok {
 				return nil, false
 			}
 
-			out = append(out, set...)
+			union = append(union, branchStrings...)
 		}
 
-		out = dedupe(out)
+		union = dedupe(union)
 
-		return out, len(out) <= maxExpand
+		return union, len(union) <= maxExpand
 
 	default:
 		return nil, false
@@ -374,87 +391,84 @@ func product(prefixes, suffixes []string) []string {
 		return nil
 	}
 
-	out := make([]string, 0, len(prefixes)*len(suffixes))
-	for _, p := range prefixes {
-		for _, s := range suffixes {
-			out = append(out, p+s)
+	combined := make([]string, 0, len(prefixes)*len(suffixes))
+	for _, prefix := range prefixes {
+		for _, suffix := range suffixes {
+			combined = append(combined, prefix+suffix)
 		}
 	}
 
-	return dedupe(out)
+	return dedupe(combined)
 }
 
-func dedupe(in []string) []string {
-	seen := make(map[string]struct{}, len(in))
-	out := in[:0]
+// dedupe drops repeated strings in place, keeping first occurrences in order.
+func dedupe(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	unique := values[:0]
 
-	for _, s := range in {
-		if _, ok := seen[s]; !ok {
-			seen[s] = struct{}{}
-			out = append(out, s)
+	for _, value := range values {
+		if _, ok := seen[value]; !ok {
+			seen[value] = struct{}{}
+			unique = append(unique, value)
 		}
 	}
 
-	return out
+	return unique
 }
 
-func minLen(lits []string) int {
-	score := len(lits[0])
-	for _, l := range lits {
-		score = min(score, len(l))
+// shortestLength is the length of the shortest of literals.
+func shortestLength(literals []string) int {
+	shortest := len(literals[0])
+	for _, literal := range literals {
+		shortest = min(shortest, len(literal))
 	}
 
-	return score
+	return shortest
 }
 
 // windowPart is what one concat part contributes to a run of exact strings.
 // A part repeated at least once contributes one iteration and ends the run:
 // GO[0-9]{3,4} means the match contains "go" and a digit, then more.
-func windowPart(re *syntax.Regexp) (set []string, last, ok bool) {
-	if set, ok := exactSet(re); ok {
-		return set, false, true
+func windowPart(node *syntax.Regexp) (partStrings []string, endsRun, ok bool) {
+	if partStrings, ok := exactSet(node); ok {
+		return partStrings, false, true
 	}
 
-	if re.Op == syntax.OpPlus || (re.Op == syntax.OpRepeat && re.Min >= 1) {
-		set, ok := exactSet(re.Sub[0])
+	if node.Op == syntax.OpPlus || (node.Op == syntax.OpRepeat && node.Min >= 1) {
+		partStrings, ok := exactSet(node.Sub[0])
 
-		return set, true, ok
+		return partStrings, true, ok
 	}
 
 	return nil, false, false
 }
 
-// commonUAs are ordinary browser UAs. A cover whose literal occurs in one of
-// them ("android ", "mobile") admits its entry on most traffic, so a concat
-// prefers any rarer mandatory part.
-var commonUAs = []string{
-	"mozilla/5.0 (linux; android 14; k) applewebkit/537.36 (khtml, like gecko) chrome/141.0.0.0 mobile safari/537.36",
-	"mozilla/5.0 (iphone; cpu iphone os 18_7 like mac os x) applewebkit/605.1.15 (khtml, like gecko) version/18.7 mobile/15e148 safari/604.1",
-	"mozilla/5.0 (windows nt 10.0; win64; x64) applewebkit/537.36 (khtml, like gecko) chrome/141.0.0.0 safari/537.36 edg/141.0.0.0",
-	"mozilla/5.0 (macintosh; intel mac os x 10_15_7) applewebkit/605.1.15 (khtml, like gecko) version/26.0 safari/605.1.15",
-	"mozilla/5.0 (x11; linux x86_64; rv:140.0) gecko/20100101 firefox/140.0",
-	"mozilla/5.0 (linux; android 16; sm-s931b build/bp2a.250605.031; wv) applewebkit/537.36 (khtml, like gecko) version/4.0 chrome/141.0.0.0 mobile safari/537.36",
-}
-
-// coverScore ranks a candidate literal cover: rare beats common, then the
+// coverScore ranks a candidate literal cover: one whose literals are not
+// shared admits fewer user agents, so it beats a shared one; then the
 // shortest literal's length decides.
-func coverScore(lits []string) int {
-	score := minLen(lits)
-
-	for _, l := range lits {
-		l = strings.ToLower(l)
-		for _, ua := range commonUAs {
-			if strings.Contains(ua, l) {
-				return score
-			}
+func coverScore(cover []string, shared map[string]bool) int {
+	for _, literal := range cover {
+		if isShared(strings.ToLower(literal), shared) {
+			return shortestLength(cover)
 		}
 	}
 
-	return 1000 + score
+	return 1000 + shortestLength(cover)
 }
 
-// commonCover reports whether any literal of a cover occurs in an ordinary
-// browser UA.
-func commonCover(lits []string) bool {
-	return coverScore(lits) < 1000
+// isShared reports whether literal is a shared literal or occurs inside one:
+// every UA containing "android 0" also contains "android ", so "android " is
+// at least as common.
+func isShared(literal string, shared map[string]bool) bool {
+	if shared[literal] {
+		return true
+	}
+
+	for sharedLiteral := range shared {
+		if strings.Contains(sharedLiteral, literal) {
+			return true
+		}
+	}
+
+	return false
 }
