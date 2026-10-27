@@ -3,7 +3,6 @@ package parser
 import (
 	"regexp"
 	"regexp/syntax"
-	"sort"
 	"strings"
 )
 
@@ -127,83 +126,9 @@ func re2Translate(p string) (string, bool) {
 	return b.String(), true
 }
 
-// GateSet narrows an entry walk (device brands, OS rules, browsers — parsers
-// with no upstream preMatchOverall) using required literals. For each entry a
-// set of case-folded literals is extracted from its regex AST such that a
-// match implies at least one literal is present in the user agent. At parse
-// time one lowercased copy of the UA and a substring probe per distinct
-// literal shrink the walk to the entries whose literal actually occurs (plus
-// the few entries no literal set could be proven for). This is what collapses
-// the aggregate walk on junk input — and most of the walk on real traffic —
-// while remaining a strict superset of the regexp2 match semantics.
-//
-// (A single combined RE2 union was tried first and was slower than the
-// per-pattern walk it replaced: Go's regexp simulates an NFA, so one pass
-// over a ~20k-state union costs more than thousands of memchr-accelerated
-// substring probes.)
-type GateSet struct {
-	// literals maps each distinct lowercased literal to the entries it can
-	// admit. Probed with strings.Contains against the lowercased UA.
-	literals map[string][]int
-	// always holds entries with no provable literal set — walked every time.
-	always []int
-	n      int
-}
-
-// CompileGateSet builds a literal gate over patterns; entries whose regex
-// yields no usable literal set are recorded as always-walk.
-func CompileGateSet(patterns []string) *GateSet {
-	g := &GateSet{literals: make(map[string][]int), n: len(patterns)}
-
-	for i, p := range patterns {
-		lits, ok := requiredLiterals(p)
-		if !ok {
-			g.always = append(g.always, i)
-
-			continue
-		}
-
-		for _, lit := range lits {
-			g.literals[lit] = append(g.literals[lit], i)
-		}
-	}
-
-	return g
-}
-
 // minGateLiteral keeps probe literals selective; branches whose best literal
 // is shorter go to the always-walk list instead of admitting most inputs.
 const minGateLiteral = 3
-
-// requiredLiterals extracts a literal cover for one database pattern: the
-// pattern can only match a UA containing at least one returned literal
-// (lowercased). ok=false when no such cover can be proven.
-func requiredLiterals(pattern string) ([]string, bool) {
-	t, ok := re2Translate(normalizePattern(pattern))
-	if !ok {
-		return nil, false
-	}
-
-	ast, err := syntax.Parse(`(?i)(?:`+t+`)`, syntax.Perl)
-	if err != nil {
-		return nil, false // lookaround etc: RE2 syntax cannot express it
-	}
-
-	lits, ok := literalCover(ast)
-	if !ok {
-		return nil, false
-	}
-
-	for i := range lits {
-		if len(lits[i]) < minGateLiteral {
-			return nil, false
-		}
-
-		lits[i] = strings.ToLower(lits[i])
-	}
-
-	return lits, true
-}
 
 // literalCover walks a parsed regex and returns literals such that any match
 // must contain at least one of them.
@@ -239,15 +164,33 @@ func literalCover(re *syntax.Regexp) ([]string, bool) {
 				continue
 			}
 
-			score := len(lits[0])
-			for _, l := range lits {
-				if len(l) < score {
-					score = len(l)
-				}
-			}
-
-			if score > bestScore {
+			if score := coverScore(lits); score > bestScore {
 				best, bestScore = lits, score
+			}
+		}
+
+		// A run of consecutive parts with a small finite language expands to
+		// exact strings: a(?:101|110) yields a101 and a110, not just a.
+		for i := range re.Sub {
+			acc := []string{""}
+
+			for j := i; j < len(re.Sub); j++ {
+				set, last, ok := windowPart(re.Sub[j])
+				if !ok {
+					break
+				}
+
+				if acc = product(acc, set); acc == nil {
+					break
+				}
+
+				if score := coverScore(acc); score > bestScore {
+					best, bestScore = acc, score
+				}
+
+				if last {
+					break
+				}
 			}
 		}
 
@@ -273,45 +216,6 @@ func literalCover(re *syntax.Regexp) ([]string, bool) {
 		// Char classes, anchors, stars, empty matches: no literal to prove.
 		return nil, false
 	}
-}
-
-// SkipGated reports whether the walk can be narrowed for ua. When it returns
-// (only, true), entries outside `only` cannot match and the caller walks just
-// those indexes (sorted, possibly empty). (nil, false) means walk everything.
-func (g *GateSet) SkipGated(ua string) ([]int, bool) {
-	if g == nil || g.literals == nil {
-		return nil, false
-	}
-
-	lower := strings.ToLower(ua)
-
-	// Collect survivors: always-walk entries plus entries admitted by a
-	// literal present in the UA.
-	seen := make(map[int]struct{}, len(g.always)+8)
-	for _, i := range g.always {
-		seen[i] = struct{}{}
-	}
-
-	for lit, idxs := range g.literals {
-		if strings.Contains(lower, lit) {
-			for _, i := range idxs {
-				seen[i] = struct{}{}
-			}
-		}
-	}
-
-	if len(seen) == g.n {
-		return nil, false
-	}
-
-	only := make([]int, 0, len(seen))
-	for i := range seen {
-		only = append(only, i)
-	}
-
-	sort.Ints(only)
-
-	return only, true
 }
 
 // GateStats reports how many cached patterns carry an RE2 gate. Diagnostic
@@ -345,4 +249,212 @@ func compileGate(pattern string) *regexp.Regexp {
 	}
 
 	return gate
+}
+
+// stripLookarounds drops lookaround groups and word boundaries. Each only
+// narrows what a pattern matches, so the result matches a superset of inputs
+// and its literal cover still gates the original pattern.
+func stripLookarounds(p string) string {
+	var b strings.Builder
+	for i := 0; i < len(p); i++ {
+		switch {
+		case p[i] == '\\' && i+1 < len(p):
+			if p[i+1] == 'b' || p[i+1] == 'B' {
+				i++
+				continue
+			}
+			b.WriteByte(p[i])
+			b.WriteByte(p[i+1])
+			i++
+		case p[i] == '(' && (strings.HasPrefix(p[i:], "(?=") || strings.HasPrefix(p[i:], "(?!") ||
+			strings.HasPrefix(p[i:], "(?<=") || strings.HasPrefix(p[i:], "(?<!")):
+			depth := 0
+			for ; i < len(p); i++ {
+				if p[i] == '\\' {
+					i++
+					continue
+				}
+				if p[i] == '(' {
+					depth++
+				} else if p[i] == ')' {
+					depth--
+					if depth == 0 {
+						break
+					}
+				}
+			}
+		default:
+			b.WriteByte(p[i])
+		}
+	}
+	return b.String()
+}
+
+// maxExpand caps how many exact strings one sub-pattern may expand into.
+const maxExpand = 64
+
+// exactSet returns every string re can match when that set is small and
+// finite, lowercased. ok=false for anything unbounded or too large.
+func exactSet(re *syntax.Regexp) ([]string, bool) {
+	switch re.Op {
+	case syntax.OpLiteral:
+		return []string{strings.ToLower(string(re.Rune))}, true
+
+	case syntax.OpEmptyMatch:
+		return []string{""}, true
+
+	case syntax.OpCapture:
+		return exactSet(re.Sub[0])
+
+	case syntax.OpCharClass:
+		var out []string
+
+		for i := 0; i < len(re.Rune); i += 2 {
+			if re.Rune[i+1]-re.Rune[i] >= maxExpand {
+				return nil, false
+			}
+
+			for r := re.Rune[i]; r <= re.Rune[i+1]; r++ {
+				out = append(out, strings.ToLower(string(r)))
+			}
+		}
+
+		out = dedupe(out)
+
+		return out, len(out) <= maxExpand
+
+	case syntax.OpQuest:
+		set, ok := exactSet(re.Sub[0])
+		if !ok {
+			return nil, false
+		}
+
+		return dedupe(append(set, "")), true
+
+	case syntax.OpConcat:
+		acc := []string{""}
+
+		for _, sub := range re.Sub {
+			set, ok := exactSet(sub)
+			if !ok {
+				return nil, false
+			}
+
+			if acc = product(acc, set); acc == nil {
+				return nil, false
+			}
+		}
+
+		return acc, true
+
+	case syntax.OpAlternate:
+		var out []string
+
+		for _, sub := range re.Sub {
+			set, ok := exactSet(sub)
+			if !ok {
+				return nil, false
+			}
+
+			out = append(out, set...)
+		}
+
+		out = dedupe(out)
+
+		return out, len(out) <= maxExpand
+
+	default:
+		return nil, false
+	}
+}
+
+// product concatenates every prefix with every suffix, or nil past maxExpand.
+func product(prefixes, suffixes []string) []string {
+	if len(prefixes)*len(suffixes) > maxExpand {
+		return nil
+	}
+
+	out := make([]string, 0, len(prefixes)*len(suffixes))
+	for _, p := range prefixes {
+		for _, s := range suffixes {
+			out = append(out, p+s)
+		}
+	}
+
+	return dedupe(out)
+}
+
+func dedupe(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := in[:0]
+
+	for _, s := range in {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+
+	return out
+}
+
+func minLen(lits []string) int {
+	score := len(lits[0])
+	for _, l := range lits {
+		score = min(score, len(l))
+	}
+
+	return score
+}
+
+// windowPart is what one concat part contributes to a run of exact strings.
+// A part repeated at least once contributes one iteration and ends the run:
+// GO[0-9]{3,4} means the match contains "go" and a digit, then more.
+func windowPart(re *syntax.Regexp) (set []string, last, ok bool) {
+	if set, ok := exactSet(re); ok {
+		return set, false, true
+	}
+
+	if re.Op == syntax.OpPlus || (re.Op == syntax.OpRepeat && re.Min >= 1) {
+		set, ok := exactSet(re.Sub[0])
+
+		return set, true, ok
+	}
+
+	return nil, false, false
+}
+
+// commonUAs are ordinary browser UAs. A cover whose literal occurs in one of
+// them ("android ", "mobile") admits its entry on most traffic, so a concat
+// prefers any rarer mandatory part.
+var commonUAs = []string{
+	"mozilla/5.0 (linux; android 14; k) applewebkit/537.36 (khtml, like gecko) chrome/141.0.0.0 mobile safari/537.36",
+	"mozilla/5.0 (iphone; cpu iphone os 18_7 like mac os x) applewebkit/605.1.15 (khtml, like gecko) version/18.7 mobile/15e148 safari/604.1",
+	"mozilla/5.0 (windows nt 10.0; win64; x64) applewebkit/537.36 (khtml, like gecko) chrome/141.0.0.0 safari/537.36 edg/141.0.0.0",
+	"mozilla/5.0 (macintosh; intel mac os x 10_15_7) applewebkit/605.1.15 (khtml, like gecko) version/26.0 safari/605.1.15",
+	"mozilla/5.0 (x11; linux x86_64; rv:140.0) gecko/20100101 firefox/140.0",
+	"mozilla/5.0 (linux; android 16; sm-s931b build/bp2a.250605.031; wv) applewebkit/537.36 (khtml, like gecko) version/4.0 chrome/141.0.0.0 mobile safari/537.36",
+}
+
+// coverScore ranks a candidate literal cover: rare beats common, then the
+// shortest literal's length decides.
+func coverScore(lits []string) int {
+	score := minLen(lits)
+
+	for _, l := range lits {
+		l = strings.ToLower(l)
+		for _, ua := range commonUAs {
+			if strings.Contains(ua, l) {
+				return score
+			}
+		}
+	}
+
+	return 1000 + score
+}
+
+// commonCover reports whether any literal of a cover occurs in an ordinary
+// browser UA.
+func commonCover(lits []string) bool {
+	return coverScore(lits) < 1000
 }

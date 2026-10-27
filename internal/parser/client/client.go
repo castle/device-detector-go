@@ -53,6 +53,9 @@ type genericParser struct {
 	entries    []clientEntry
 	overall    string
 	truncation int
+	// gateSet proves most user agents match no entry, which also rules out
+	// overall: it is the same entries joined with |.
+	gateSet *parser.GateSet
 }
 
 func newGeneric(fsys fs.FS, file, name string) (*genericParser, error) {
@@ -71,6 +74,7 @@ func newGeneric(fsys fs.FS, file, name string) (*genericParser, error) {
 		entries:    entries,
 		overall:    parser.CombineRegexes(patterns),
 		truncation: parser.VersionTruncationMinor,
+		gateSet:    parser.CompileGateSet(patterns),
 	}, nil
 }
 
@@ -97,6 +101,11 @@ func (p *genericParser) Parse(ua string, _ *parser.ClientHints) (*Result, error)
 		return nil, nil
 	}
 
+	only, gated := p.gateSet.SkipGated(ua)
+	if gated && len(only) == 0 {
+		return nil, nil
+	}
+
 	overall, err := parser.MatchUserAgent(ua, p.overall)
 	if err != nil {
 		return nil, err
@@ -106,7 +115,14 @@ func (p *genericParser) Parse(ua string, _ *parser.ClientHints) (*Result, error)
 		return nil, nil
 	}
 
-	for i := range p.entries {
+	if !gated {
+		only = make([]int, len(p.entries))
+		for i := range only {
+			only[i] = i
+		}
+	}
+
+	for _, i := range only {
 		matches, err := parser.MatchUserAgent(ua, p.entries[i].Regex)
 		if err != nil {
 			return nil, err

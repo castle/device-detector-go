@@ -181,6 +181,9 @@ type base struct {
 	// probes (the upstream device parsers have no preMatchOverall to lean
 	// on): only brands whose literal occurs in the UA are walked.
 	gateSet *parser.GateSet
+	// modelGates[i] narrows brand i's model walk the same way (nil when the
+	// brand has no model list).
+	modelGates []*parser.GateSet
 }
 
 func loadBase(fsys fs.FS, name, file string) (base, error) {
@@ -197,6 +200,21 @@ func loadBase(fsys fs.FS, name, file string) (base, error) {
 	}
 
 	b.gateSet = parser.CompileGateSet(patterns)
+
+	b.modelGates = make([]*parser.GateSet, len(b.regexes.Entries))
+	for i := range b.regexes.Entries {
+		models := b.regexes.Entries[i].Value.Models
+		if len(models) == 0 {
+			continue
+		}
+
+		modelPatterns := make([]string, len(models))
+		for j := range models {
+			modelPatterns[j] = models[j].Regex
+		}
+
+		b.modelGates[i] = parser.CompileGateSet(modelPatterns)
+	}
 
 	return b, nil
 }
@@ -279,6 +297,7 @@ func (b *base) parse(ua string, hints *parser.ClientHints) (*Result, error) {
 
 	var (
 		matchedBrand string
+		brandIdx     int
 		regex        *deviceRegex
 		matches      []string
 	)
@@ -292,6 +311,7 @@ func (b *base) parse(ua string, hints *parser.ClientHints) (*Result, error) {
 		}
 
 		matchedBrand = e.Key
+		brandIdx = i
 		regex = &e.Value
 		matches = m
 
@@ -356,19 +376,35 @@ func (b *base) parse(ua string, hints *parser.ClientHints) (*Result, error) {
 			modelMatches []string
 		)
 
-		for i := range regex.Models {
+		walk := func(i int) (bool, error) {
 			mr := &regex.Models[i]
 
 			m, err := parser.MatchUserAgent(ua, mr.Regex)
-			if err != nil {
-				return nil, err
+			if err != nil || m == nil {
+				return false, err
 			}
 
-			if m != nil {
-				modelRegex = mr
-				modelMatches = m
+			modelRegex = mr
+			modelMatches = m
 
-				break
+			return true, nil
+		}
+
+		if only, ok := b.modelGates[brandIdx].SkipGated(ua); ok {
+			for _, i := range only {
+				if hit, err := walk(i); err != nil {
+					return nil, err
+				} else if hit {
+					break
+				}
+			}
+		} else {
+			for i := range regex.Models {
+				if hit, err := walk(i); err != nil {
+					return nil, err
+				} else if hit {
+					break
+				}
 			}
 		}
 
@@ -410,6 +446,12 @@ func newPreMatch(fsys fs.FS, name, file string) (preMatchParser, error) {
 // Parse runs the combined pre-match before delegating to the generic flow.
 func (p *preMatchParser) Parse(ua string, hints *parser.ClientHints) (*Result, error) {
 	if parser.PreMatchEmpty(p.combined) {
+		return nil, nil
+	}
+
+	// No brand can match, so neither can combined: it is the same brands
+	// joined with |.
+	if only, gated := p.gateSet.SkipGated(ua); gated && len(only) == 0 {
 		return nil, nil
 	}
 

@@ -35,6 +35,9 @@ type botEntry struct {
 type Bot struct {
 	entries []botEntry
 	overall *Compiled
+	// gateSet proves most user agents match no entry, which also rules out
+	// overall: it is the same entries joined with |.
+	gateSet *GateSet
 }
 
 // NewBot loads bots.yml from fsys, precompiles every entry regex and builds the
@@ -69,7 +72,7 @@ func NewBot(fsys fs.FS) (*Bot, error) {
 		return nil, fmt.Errorf("devicedetector: compiling combined bot regex: %w", err)
 	}
 
-	return &Bot{entries: entries, overall: overall}, nil
+	return &Bot{entries: entries, overall: overall, gateSet: CompileGateSet(patterns)}, nil
 }
 
 // Parse checks whether ua belongs to a bot and returns its details.
@@ -82,6 +85,11 @@ func (b *Bot) Parse(ua string) (*BotResult, error) {
 		return nil, nil
 	}
 
+	only, gated := b.gateSet.SkipGated(ua)
+	if gated && len(only) == 0 {
+		return nil, nil
+	}
+
 	pre, err := matchWith(b.overall, ua)
 	if err != nil {
 		return nil, err
@@ -91,23 +99,34 @@ func (b *Bot) Parse(ua string) (*BotResult, error) {
 		return nil, nil
 	}
 
-	for i := range b.entries {
+	walk := func(i int) (*BotResult, error) {
 		m, err := matchWith(b.entries[i].compiled, ua)
-		if err != nil {
+		if err != nil || m == nil {
 			return nil, err
 		}
 
-		if m != nil {
-			e := b.entries[i]
+		e := b.entries[i]
 
-			return &BotResult{
-				// Bot::parse substitutes $1..$N in the name from the match,
-				// e.g. name "$1" over regex "(360Spider(?:-Image|-Video)?)".
-				Name:     BuildByMatch(e.Name, m),
-				Category: e.Category,
-				URL:      e.URL,
-				Producer: e.Producer,
-			}, nil
+		return &BotResult{
+			// Bot::parse substitutes $1..$N in the name from the match,
+			// e.g. name "$1" over regex "(360Spider(?:-Image|-Video)?)".
+			Name:     BuildByMatch(e.Name, m),
+			Category: e.Category,
+			URL:      e.URL,
+			Producer: e.Producer,
+		}, nil
+	}
+
+	if !gated {
+		only = make([]int, len(b.entries))
+		for i := range only {
+			only[i] = i
+		}
+	}
+
+	for _, i := range only {
+		if res, err := walk(i); err != nil || res != nil {
+			return res, err
 		}
 	}
 
@@ -119,6 +138,10 @@ func (b *Bot) Parse(ua string) (*BotResult, error) {
 // evaluated.
 func (b *Bot) IsBot(ua string) (bool, error) {
 	if b.overall == nil {
+		return false, nil
+	}
+
+	if only, gated := b.gateSet.SkipGated(ua); gated && len(only) == 0 {
 		return false, nil
 	}
 
