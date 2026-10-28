@@ -11,6 +11,18 @@ Each release also notes the pinned matomo/device-detector database commit it shi
 
 ## [Unreleased]
 
+### Changed — database resynced to matomo/device-detector 6.5.2
+
+- Regexes and fixtures from release **6.5.2** (commit `e83ce7a97f05d8ee3e1eee7ea77a73b3bdfebd9a`); the corpus grows
+  to 38,301 entries, all identical to upstream.
+- Ported the 6.5.2 tables: 72 device brands (`9X` is now `NEO`, `7S` is now
+  `SHIFT`), 12 browsers, 10 operating systems, their families, and the Fire OS
+  and Lineage OS version maps.
+- Ported the 6.5.2 logic: client hints restore Android 16/17 and Windows user
+  agents and report the Blink engine version; a `PC;` fragment means desktop;
+  ThinOS devices are Dell; VIDAA devices are TVs; Odin is a TV client; Steam
+  is not a desktop fragment.
+
 ## [1.2.0] - 2026-08-05
 
 ### Added — RE2/literal prefilter (the v1.2 performance pass)
