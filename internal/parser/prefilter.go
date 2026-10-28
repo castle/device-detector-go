@@ -225,7 +225,7 @@ func GateStats() (gated, total int) {
 	regexCache.Range(func(_, v any) bool {
 		total++
 
-		if v.(*Compiled).gate != nil {
+		if v.(*Compiled).quickCheck() != nil {
 			gated++
 		}
 
