@@ -121,7 +121,7 @@ func (b *Browser) Warm() error {
 
 // Parse mirrors Browser::parse() on the pure user-agent path.
 func (b *Browser) Parse(ua string, hints *parser.ClientHints) (*Result, error) {
-	chName, chShort, chVersion := b.parseFromClientHints(hints)
+	chName, chShort, chVersion, chEngine, chEngineVersion := b.parseFromClientHints(hints)
 
 	ua0, err := b.parseFromUserAgent(ua)
 	if err != nil {
@@ -134,6 +134,7 @@ func (b *Browser) Parse(ua string, hints *parser.ClientHints) (*Result, error) {
 	// are present.
 	if chName != "" && chVersion != "" {
 		name, version, short = chName, chVersion, chShort
+		engine, engineVersion = chEngine, chEngineVersion
 
 		// A client-hints version of the form 2020..2024 identifies Iridium.
 		if iridiumRe.MatchString(version) {
@@ -154,11 +155,20 @@ func (b *Browser) Parse(ua string, hints *parser.ClientHints) (*Result, error) {
 			engine, engineVersion = ua0.engine, ua0.engineVersion
 		}
 
+		if engine == "Blink" && name != "Iridium" && ua0.engine == engine &&
+			phpVersionCompare(ua0.engineVersion, engineVersion) > 0 {
+			engineVersion = ua0.engineVersion
+		}
+
 		// Client hints report Chromium, but the UA detected a specific
 		// Chromium-based browser — prefer that.
 		if (name == "Chromium" || name == "Chrome Webview") && ua0.name != "" &&
 			!slicesContains([]string{"CR", "CV", "AN", "CM"}, ua0.short) {
-			name, short, version = ua0.name, ua0.short, ua0.version
+			name, short = ua0.name, ua0.short
+
+			if parser.PHPAtoi(ua0.version) != parser.PHPAtoi(version) || phpVersionCompare(version, ua0.version) <= 0 {
+				version = ua0.version
+			}
 		}
 
 		// Fix mobile browser names, e.g. Chrome => Chrome Mobile.
@@ -188,6 +198,10 @@ func (b *Browser) Parse(ua string, hints *parser.ClientHints) (*Result, error) {
 		// Prefer a more detailed engine version reported via client hints.
 		if engine == "Blink" && name != "Iridium" && phpVersionCompare(engineVersion, chVersion) < 0 {
 			engineVersion = chVersion
+		}
+
+		if engine == "Blink" && name != "Iridium" && phpVersionCompare(ua0.engineVersion, chEngineVersion) < 0 {
+			engineVersion = chEngineVersion
 		}
 	} else {
 		name, version, short = ua0.name, ua0.version, ua0.short
@@ -280,6 +294,7 @@ var browserClientHintMapping = map[string][]string{
 	"Norton Private Browser":     {"Norton Secure Browser"},
 	"Opera GX":                   {"Opera GX Android"},
 	"Opera Mini":                 {"Opera Mini Android"},
+	"Puffin Cloud Browser":       {"Puffin"},
 	"Vewd Browser":               {"Vewd Core"},
 	"Yandex Browser":             {"YaSearchBrowser"},
 }
@@ -303,15 +318,28 @@ func browserFamilyOf(label string) string {
 	return f
 }
 
+// engineBrands are the client-hints brands that report the Blink engine version.
+var engineBrands = []string{"Android WebView", "Chromium"}
+
 // parseFromClientHints mirrors Browser::parseBrowserFromClientHints.
-func (b *Browser) parseFromClientHints(hints *parser.ClientHints) (name, short, version string) {
+func (b *Browser) parseFromClientHints(hints *parser.ClientHints) (name, short, version, engine, engineVersion string) {
 	if hints == nil {
-		return "", "", ""
+		return "", "", "", "", ""
 	}
 
 	brands := hints.BrandList()
 	if len(brands) == 0 {
-		return "", "", ""
+		return "", "", "", "", ""
+	}
+
+engines:
+	for _, engineBrand := range engineBrands {
+		for _, bv := range brands {
+			if bv.Brand == engineBrand {
+				engine, engineVersion = "Blink", bv.Version
+				break engines
+			}
+		}
 	}
 
 	for _, bv := range brands {
@@ -321,13 +349,17 @@ func (b *Browser) parseFromClientHints(hints *parser.ClientHints) (name, short, 
 			if parser.FuzzyCompare(brand, e.Name) ||
 				parser.FuzzyCompare(brand+" Browser", e.Name) ||
 				parser.FuzzyCompare(brand, e.Name+" Browser") {
+				if name == "Chrome" && e.Name == "Chromium" {
+					break
+				}
+
 				name, short, version = e.Name, e.Short, bv.Version
 				break
 			}
 		}
 
-		// Keep looking past Chromium / Microsoft Edge for a more specific brand.
-		if name != "" && name != "Chromium" && name != "Microsoft Edge" {
+		// Keep looking past Chrome / Chromium / Microsoft Edge for a more specific brand.
+		if name != "" && name != "Chrome" && name != "Chromium" && name != "Microsoft Edge" {
 			break
 		}
 	}
@@ -336,7 +368,7 @@ func (b *Browser) parseFromClientHints(hints *parser.ClientHints) (name, short, 
 		version = bvers
 	}
 
-	return name, short, parser.BuildVersion(version, nil, b.truncation)
+	return name, short, parser.BuildVersion(version, nil, b.truncation), engine, engineVersion
 }
 
 // browserHintName returns the browser name for the client-hints app id, or "".

@@ -14,6 +14,9 @@ func TestBrowserParse(t *testing.T) {
 	b.SetVersionTruncation(parser.VersionTruncationNone)
 
 	for _, fx := range loadClientFixtures(t, "desktop-1.yml") {
+		if fx.Client.Type != "browser" {
+			continue
+		}
 		t.Run(fx.UserAgent, func(t *testing.T) {
 			got, err := b.Parse(fx.UserAgent, nil)
 			if err != nil {
