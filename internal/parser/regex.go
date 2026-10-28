@@ -47,8 +47,18 @@ func MatchTimeout() time.Duration { return time.Duration(matchTimeoutNanos.Load(
 // Compiled pairs the authoritative regexp2 pattern with its optional RE2
 // prefilter gate (nil when the pattern cannot be gated — see prefilter.go).
 type Compiled struct {
-	full *regexp2.Regexp
-	gate *regexp.Regexp
+	full    *regexp2.Regexp
+	pattern string
+	// The RE2 quick check is built on first use: most entries never survive
+	// a GateSet, so most quick checks would otherwise sit unused in memory.
+	gateOnce sync.Once
+	gate     *regexp.Regexp
+}
+
+func (c *Compiled) quickCheck() *regexp.Regexp {
+	c.gateOnce.Do(func() { c.gate = compileGate(c.pattern) })
+
+	return c.gate
 }
 
 // Full exposes the underlying regexp2 for callers that manage matching
@@ -110,7 +120,7 @@ func Compile(pattern string) (*Compiled, error) {
 
 	StampTimeout(re)
 
-	c := &Compiled{full: re, gate: compileGate(pattern)}
+	c := &Compiled{full: re, pattern: pattern}
 
 	regexCache.Store(pattern, c)
 
@@ -147,7 +157,7 @@ func matchWith(c *Compiled, ua string) ([]string, error) {
 	// semantics: a gate miss proves the full pattern cannot match, skipping
 	// the backtracking engine entirely. Linear in len(ua) regardless of
 	// pattern size.
-	if c.gate != nil && !c.gate.MatchString(ua) {
+	if gate := c.quickCheck(); gate != nil && !gate.MatchString(ua) {
 		return nil, nil
 	}
 
